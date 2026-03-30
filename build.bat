@@ -21,3 +21,5 @@ go build -o release/onedrivecli-linux-arm64 ./cmd/onedrivecli
 set GOOS=
 set GOARCH=
 set CGO_ENABLED=
+
+echo Done.
