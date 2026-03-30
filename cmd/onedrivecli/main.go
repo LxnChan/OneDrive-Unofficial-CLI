@@ -8,8 +8,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"onedrivecli/internal/auth"
@@ -42,11 +46,17 @@ func run(args []string) error {
 
 	gfs := flag.NewFlagSet("global", flag.ContinueOnError)
 	gfs.SetOutput(ioDiscard{})
+	cfgPath := gfs.String("config", "", "Config file path. Default: ./config.json next to the executable. On Linux, also tries /etc/odc/config.json")
 	ua := gfs.String("user-agent", "", "Set User-Agent for all requests and persist to config.json")
 	px := gfs.String("proxy", "", "Proxy: system/none or http(s)://host:port or host:port (persist to config.json)")
 	verb := gfs.Bool("verbose", false, "Enable verbose output")
 	_ = gfs.Parse(args)
 	rest := gfs.Args()
+	if *cfgPath != "" {
+		if err := config.SetPath(*cfgPath); err != nil {
+			return err
+		}
+	}
 	if *ua != "" {
 		globalUserAgent = *ua
 		cfg, err := config.Load()
@@ -99,7 +109,7 @@ func printUsage() {
 onedrivecli - OneDrive CLI (Microsoft Graph + OAuth2 Device Code)
 
 Usage:
-  onedrivecli [--user-agent=<UA>] [--proxy=<MODE>] [--verbose=<true|false>] <command> [options]
+  onedrivecli [--config=<PATH>] [--user-agent=<UA>] [--proxy=<MODE>] [--verbose=<true|false>] <command> [options]
 
 Commands:
   login      Sign in (Device Code flow)
@@ -110,6 +120,7 @@ Commands:
   download   Download a file or folder
 
 Examples:
+  onedrivecli --config=./config.json status
   onedrivecli --user-agent="MyApp/1.0" --proxy=system --verbose=true login --client-id=<APP_CLIENT_ID>
   onedrivecli status
   onedrivecli list --path=/Documents
@@ -121,6 +132,7 @@ Examples:
 func cmdLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	fs.SetOutput(ioDiscard{})
+	cfgPath := fs.String("config", "", "Config file path. Default: ./config.json next to the executable. On Linux, also tries /etc/odc/config.json")
 	clientID := fs.String("client-id", "", "Azure app (public client) client ID")
 	tenant := fs.String("tenant", "", "Tenant: common (default) / consumers / organizations / or a specific tenant ID")
 	scopes := fs.String("scopes", "", "Scopes (space or comma separated). Default: offline_access User.Read Files.ReadWrite.All")
@@ -129,6 +141,11 @@ func cmdLogin(args []string) error {
 	verb := fs.Bool("verbose", false, "Enable verbose output")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *cfgPath != "" {
+		if err := config.SetPath(*cfgPath); err != nil {
+			return err
+		}
 	}
 	clientIDProvided := *clientID != ""
 	tenantProvided := *tenant != ""
@@ -176,10 +193,10 @@ func cmdLogin(args []string) error {
 	}
 	if isFirstConfig {
 		if usedDefaultClientID {
-			fmt.Printf("Note: --client-id was not provided. Using built-in application ID: %s (override with --client-id=...)\n", defaultClientID)
+			fmt.Printf("Note: --client-id was not provided. Using built-in application ID. (you can override with --client-id=...)\n")
 		}
 		if !tenantProvided && *tenant == "common" {
-			fmt.Println("Note: --tenant was not provided. Using tenant=common (supports both personal and work accounts).")
+			fmt.Println("Note: --tenant was not provided. Using tenant=common.")
 		}
 	}
 
@@ -229,11 +246,17 @@ func cmdLogin(args []string) error {
 func cmdLogout(args []string) error {
 	fs := flag.NewFlagSet("logout", flag.ContinueOnError)
 	fs.SetOutput(ioDiscard{})
+	cfgPath := fs.String("config", "", "Config file path. Default: ./config.json next to the executable. On Linux, also tries /etc/odc/config.json")
 	ua := fs.String("user-agent", "", "Set User-Agent for all requests and persist to config.json")
 	px := fs.String("proxy", "", "Proxy: system/none or http(s)://host:port or host:port (persist to config.json)")
 	verb := fs.Bool("verbose", false, "Enable verbose output")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *cfgPath != "" {
+		if err := config.SetPath(*cfgPath); err != nil {
+			return err
+		}
 	}
 	if *ua != "" {
 		globalUserAgent = *ua
@@ -262,11 +285,17 @@ func cmdLogout(args []string) error {
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(ioDiscard{})
+	cfgPath := fs.String("config", "", "Config file path. Default: ./config.json next to the executable. On Linux, also tries /etc/odc/config.json")
 	ua := fs.String("user-agent", "", "Set User-Agent for all requests and persist to config.json")
 	px := fs.String("proxy", "", "Proxy: system/none or http(s)://host:port or host:port (persist to config.json)")
 	verb := fs.Bool("verbose", false, "Enable verbose output")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *cfgPath != "" {
+		if err := config.SetPath(*cfgPath); err != nil {
+			return err
+		}
 	}
 	if *ua != "" {
 		globalUserAgent = *ua
@@ -349,7 +378,7 @@ func cmdStatus(args []string) error {
 		if root.Folder != nil {
 			rootChildren = root.Folder.ChildCount
 		}
-		fmt.Printf("Root: %s (children %d)\n", root.Name, rootChildren)
+		fmt.Printf("Root: %s (%d children)\n", root.Name, rootChildren)
 	}
 	if recentErr != nil {
 		fmt.Printf("Recent: %s\n", "(unavailable)")
@@ -363,11 +392,17 @@ func cmdList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	fs.SetOutput(ioDiscard{})
 	remotePath := fs.String("path", "", "Remote directory path (e.g. /Documents). Empty means root.")
+	cfgPath := fs.String("config", "", "Config file path. Default: ./config.json next to the executable. On Linux, also tries /etc/odc/config.json")
 	ua := fs.String("user-agent", "", "Set User-Agent for all requests and persist to config.json")
 	px := fs.String("proxy", "", "Proxy: system/none or http(s)://host:port or host:port (persist to config.json)")
 	verb := fs.Bool("verbose", false, "Enable verbose output")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *cfgPath != "" {
+		if err := config.SetPath(*cfgPath); err != nil {
+			return err
+		}
 	}
 	if *ua != "" {
 		globalUserAgent = *ua
@@ -415,11 +450,19 @@ func cmdUpload(args []string) error {
 	fs.SetOutput(ioDiscard{})
 	localPath := fs.String("local", "", "Local file or folder path")
 	remotePath := fs.String("remote", "", "Remote target path (file: includes filename; folder: target directory)")
+	cfgPath := fs.String("config", "", "Config file path. Default: ./config.json next to the executable. On Linux, also tries /etc/odc/config.json")
 	ua := fs.String("user-agent", "", "Set User-Agent for all requests and persist to config.json")
 	px := fs.String("proxy", "", "Proxy: system/none or http(s)://host:port or host:port (persist to config.json)")
+	chunkSizeStr := fs.String("chunk-size", "", "Chunk size for transfers (e.g. 10MiB, 10485760)")
+	threadsFlag := fs.Int("threads", 0, "Number of threads (upload: chunk workers for a file; for a folder: concurrent files)")
 	verb := fs.Bool("verbose", false, "Enable verbose output")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *cfgPath != "" {
+		if err := config.SetPath(*cfgPath); err != nil {
+			return err
+		}
 	}
 	if *localPath == "" || *remotePath == "" {
 		return errors.New("--local and --remote are required")
@@ -443,6 +486,30 @@ func cmdUpload(args []string) error {
 		cfg.Proxy = *px
 		_ = config.Save(cfg)
 	}
+
+	chunkSize := cfg.UploadChunkSize
+	if flagProvided(args, "chunk-size") {
+		v, err := parseByteSize(*chunkSizeStr)
+		if err != nil {
+			return err
+		}
+		chunkSize = v
+		cfg.UploadChunkSize = v
+		_ = config.Save(cfg)
+	}
+	threads := cfg.UploadThreads
+	if flagProvided(args, "threads") {
+		if *threadsFlag <= 0 {
+			return errors.New("--threads must be >= 1")
+		}
+		threads = *threadsFlag
+		cfg.UploadThreads = threads
+		_ = config.Save(cfg)
+	}
+	if threads <= 0 {
+		threads = 2
+	}
+
 	ctx := context.Background()
 	gc, err := graphClientFromConfig(cfg)
 	if err != nil {
@@ -455,13 +522,126 @@ func cmdUpload(args []string) error {
 	}
 
 	if st.IsDir() {
-		rp := *remotePath
-		if strings.HasSuffix(rp, "/") || strings.HasSuffix(rp, "\\") {
-			rp = strings.TrimRight(rp, "/\\")
+		remoteBase := strings.TrimRight(*remotePath, "/\\")
+		remoteBase = strings.ReplaceAll(remoteBase, "\\", "/")
+
+		type job struct {
+			local  string
+			remote string
+			size   int64
+			chunks int64
 		}
-		if err := gc.UploadFolder(ctx, *localPath, rp); err != nil {
+
+		var jobs []job
+		var totalBytes int64
+		var totalChunks int64
+		normalizedChunk := normalizeUploadChunkSize(chunkSize)
+
+		err := filepath.WalkDir(*localPath, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(*localPath, path)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+			rp := remoteBase
+			if rp == "" {
+				rp = "/" + rel
+			} else {
+				if !strings.HasPrefix(rp, "/") {
+					rp = "/" + rp
+				}
+				rp = rp + "/" + rel
+			}
+			chunks := int64(1)
+			const maxSimpleUpload = 4 * 1024 * 1024
+			if info.Size() > maxSimpleUpload {
+				chunks = (info.Size() + normalizedChunk - 1) / normalizedChunk
+			}
+			jobs = append(jobs, job{local: path, remote: rp, size: info.Size(), chunks: chunks})
+			totalBytes += info.Size()
+			totalChunks += chunks
+			return nil
+		})
+		if err != nil {
 			return err
 		}
+
+		if remoteBase != "" {
+			if !strings.HasPrefix(remoteBase, "/") {
+				remoteBase = "/" + remoteBase
+			}
+			if err := gc.EnsureRemoteFolder(ctx, remoteBase); err != nil {
+				return err
+			}
+		}
+
+		var bytesDone int64
+		var chunksDone int64
+		pp := newProgressPrinter("upload", totalBytes, totalChunks, threads, &bytesDone, &chunksDone)
+		pp.Start()
+		defer pp.Stop()
+
+		workCh := make(chan job, threads)
+		errCh := make(chan error, 1)
+		var wg sync.WaitGroup
+		for i := 0; i < threads; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := range workCh {
+					parent := path.Dir(j.remote)
+					parent = strings.TrimSuffix(parent, "/")
+					if parent == "." {
+						parent = ""
+					}
+					if parent != "" && parent != "/" {
+						if err := gc.EnsureRemoteFolder(ctx, parent); err != nil {
+							select {
+							case errCh <- err:
+							default:
+							}
+							return
+						}
+					}
+					if err := gc.UploadFileWithOptions(ctx, j.local, j.remote, graph.TransferOptions{
+						ChunkSize: normalizedChunk,
+						Threads:   1,
+						Callbacks: graph.TransferCallbacks{
+							OnBytes: func(n int64) { atomic.AddInt64(&bytesDone, n) },
+							OnChunk: func() { atomic.AddInt64(&chunksDone, 1) },
+						},
+					}); err != nil {
+						select {
+						case errCh <- err:
+						default:
+						}
+						return
+					}
+				}
+			}()
+		}
+		for _, j := range jobs {
+			workCh <- j
+		}
+		close(workCh)
+		wg.Wait()
+
+		select {
+		case err := <-errCh:
+			return err
+		default:
+		}
+		pp.Stop()
 		fmt.Println("Upload completed")
 		return nil
 	}
@@ -471,9 +651,35 @@ func cmdUpload(args []string) error {
 		rp = strings.TrimRight(rp, "/\\")
 		rp = rp + "/" + filepath.Base(*localPath)
 	}
-	if err := gc.UploadFile(ctx, *localPath, rp); err != nil {
+	rp = strings.ReplaceAll(rp, "\\", "/")
+	if !strings.HasPrefix(rp, "/") {
+		rp = "/" + rp
+	}
+
+	normalizedChunk := normalizeUploadChunkSize(chunkSize)
+	const maxSimpleUpload = 4 * 1024 * 1024
+	totalBytes := st.Size()
+	totalChunks := int64(1)
+	if st.Size() > maxSimpleUpload {
+		totalChunks = (st.Size() + normalizedChunk - 1) / normalizedChunk
+	}
+	var bytesDone int64
+	var chunksDone int64
+	pp := newProgressPrinter("upload", totalBytes, totalChunks, threads, &bytesDone, &chunksDone)
+	pp.Start()
+	defer pp.Stop()
+
+	if err := gc.UploadFileWithOptions(ctx, *localPath, rp, graph.TransferOptions{
+		ChunkSize: normalizedChunk,
+		Threads:   threads,
+		Callbacks: graph.TransferCallbacks{
+			OnBytes: func(n int64) { atomic.AddInt64(&bytesDone, n) },
+			OnChunk: func() { atomic.AddInt64(&chunksDone, 1) },
+		},
+	}); err != nil {
 		return err
 	}
+	pp.Stop()
 	fmt.Println("Upload completed")
 	return nil
 }
@@ -483,11 +689,19 @@ func cmdDownload(args []string) error {
 	fs.SetOutput(ioDiscard{})
 	remotePath := fs.String("remote", "", "Remote file or folder path")
 	localPath := fs.String("local", "", "Local target path (file: target file; folder: target directory, optional)")
+	cfgPath := fs.String("config", "", "Config file path. Default: ./config.json next to the executable. On Linux, also tries /etc/odc/config.json")
 	ua := fs.String("user-agent", "", "Set User-Agent for all requests and persist to config.json")
 	px := fs.String("proxy", "", "Proxy: system/none or http(s)://host:port or host:port (persist to config.json)")
+	chunkSizeStr := fs.String("chunk-size", "", "Chunk size for transfers (e.g. 8MiB, 10485760)")
+	threadsFlag := fs.Int("threads", 0, "Number of threads (download: range workers for a file; for a folder: concurrent files)")
 	verb := fs.Bool("verbose", false, "Enable verbose output")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *cfgPath != "" {
+		if err := config.SetPath(*cfgPath); err != nil {
+			return err
+		}
 	}
 	if *remotePath == "" {
 		return errors.New("--remote is required")
@@ -511,15 +725,172 @@ func cmdDownload(args []string) error {
 		cfg.Proxy = *px
 		_ = config.Save(cfg)
 	}
+
+	chunkSize := cfg.DownloadChunkSize
+	if flagProvided(args, "chunk-size") {
+		v, err := parseByteSize(*chunkSizeStr)
+		if err != nil {
+			return err
+		}
+		chunkSize = v
+		cfg.DownloadChunkSize = v
+		_ = config.Save(cfg)
+	}
+	threads := cfg.DownloadThreads
+	if flagProvided(args, "threads") {
+		if *threadsFlag <= 0 {
+			return errors.New("--threads must be >= 1")
+		}
+		threads = *threadsFlag
+		cfg.DownloadThreads = threads
+		_ = config.Save(cfg)
+	}
+	if threads <= 0 {
+		threads = 2
+	}
 	ctx := context.Background()
 	gc, err := graphClientFromConfig(cfg)
 	if err != nil {
 		return err
 	}
 
-	if err := gc.DownloadItem(ctx, *remotePath, *localPath); err != nil {
+	it, err := gc.GetItemByPath(ctx, *remotePath)
+	if err != nil {
 		return err
 	}
+	normalizedChunk := normalizeDownloadChunkSize(chunkSize)
+
+	if it.Folder == nil {
+		totalBytes := it.Size
+		totalChunks := int64(1)
+		if it.Size > 0 {
+			totalChunks = (it.Size + normalizedChunk - 1) / normalizedChunk
+		}
+		var bytesDone int64
+		var chunksDone int64
+		pp := newProgressPrinter("download", totalBytes, totalChunks, threads, &bytesDone, &chunksDone)
+		pp.Start()
+		defer pp.Stop()
+
+		if err := gc.DownloadFileByPathWithOptions(ctx, *remotePath, *localPath, graph.TransferOptions{
+			ChunkSize: normalizedChunk,
+			Threads:   threads,
+			Callbacks: graph.TransferCallbacks{
+				OnBytes: func(n int64) { atomic.AddInt64(&bytesDone, n) },
+				OnChunk: func() { atomic.AddInt64(&chunksDone, 1) },
+			},
+		}); err != nil {
+			return err
+		}
+		pp.Stop()
+		fmt.Println("Download completed")
+		return nil
+	}
+
+	baseLocal := *localPath
+	if baseLocal == "" {
+		base := filepath.Base(filepath.ToSlash(strings.TrimRight(*remotePath, "/")))
+		if base == "" || base == "." || base == "/" {
+			base = "onedrive_folder"
+		}
+		baseLocal = base
+	}
+	if err := os.MkdirAll(baseLocal, 0o755); err != nil {
+		return err
+	}
+
+	type job struct {
+		remote string
+		local  string
+		size   int64
+		chunks int64
+	}
+
+	var jobs []job
+	var totalBytes int64
+	var totalChunks int64
+
+	var walk func(remoteDir, localDir string) error
+	walk = func(remoteDir, localDir string) error {
+		children, err := gc.ListChildren(ctx, remoteDir)
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			cr := strings.TrimRight(remoteDir, "/")
+			var childRemote string
+			if cr == "" {
+				childRemote = "/" + child.Name
+			} else {
+				childRemote = cr + "/" + child.Name
+			}
+			childLocal := filepath.Join(localDir, child.Name)
+			if child.Folder != nil {
+				if err := os.MkdirAll(childLocal, 0o755); err != nil {
+					return err
+				}
+				if err := walk(childRemote, childLocal); err != nil {
+					return err
+				}
+				continue
+			}
+			chunks := int64(1)
+			if child.Size > 0 {
+				chunks = (child.Size + normalizedChunk - 1) / normalizedChunk
+			}
+			jobs = append(jobs, job{remote: childRemote, local: childLocal, size: child.Size, chunks: chunks})
+			totalBytes += child.Size
+			totalChunks += chunks
+		}
+		return nil
+	}
+	if err := walk(*remotePath, baseLocal); err != nil {
+		return err
+	}
+
+	var bytesDone int64
+	var chunksDone int64
+	pp := newProgressPrinter("download", totalBytes, totalChunks, threads, &bytesDone, &chunksDone)
+	pp.Start()
+	defer pp.Stop()
+
+	workCh := make(chan job, threads)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range workCh {
+				if err := gc.DownloadFileByPathWithOptions(ctx, j.remote, j.local, graph.TransferOptions{
+					ChunkSize: normalizedChunk,
+					Threads:   1,
+					Callbacks: graph.TransferCallbacks{
+						OnBytes: func(n int64) { atomic.AddInt64(&bytesDone, n) },
+						OnChunk: func() { atomic.AddInt64(&chunksDone, 1) },
+					},
+				}); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	for _, j := range jobs {
+		workCh <- j
+	}
+	close(workCh)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+	pp.Stop()
 	fmt.Println("Download completed")
 	return nil
 }
@@ -659,4 +1030,206 @@ func validateFlagStyle(args []string) error {
 		}
 	}
 	return nil
+}
+
+func flagProvided(args []string, name string) bool {
+	prefix := "--" + name + "="
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseByteSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, errors.New("byte size is required")
+	}
+
+	upper := strings.ToUpper(s)
+	mults := map[string]int64{
+		"B":   1,
+		"KB":  1000,
+		"MB":  1000 * 1000,
+		"GB":  1000 * 1000 * 1000,
+		"KIB": 1024,
+		"MIB": 1024 * 1024,
+		"GIB": 1024 * 1024 * 1024,
+	}
+
+	for suf, m := range mults {
+		if strings.HasSuffix(upper, suf) && len(upper) > len(suf) {
+			num := strings.TrimSpace(upper[:len(upper)-len(suf)])
+			v, err := strconv.ParseInt(num, 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("invalid byte size: %s", s)
+			}
+			if v < 0 {
+				return 0, fmt.Errorf("invalid byte size: %s", s)
+			}
+			return v * m, nil
+		}
+	}
+
+	v, err := strconv.ParseInt(upper, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid byte size: %s", s)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("invalid byte size: %s", s)
+	}
+	return v, nil
+}
+
+func normalizeUploadChunkSize(n int64) int64 {
+	const min = 5 * 1024 * 1024
+	const max = 60 * 1024 * 1024
+	if n <= 0 {
+		return 10 * 1024 * 1024
+	}
+	if n < min {
+		n = min
+	}
+	if n > max {
+		n = max
+	}
+	n = (n / (1 * 1024 * 1024)) * (1 * 1024 * 1024)
+	if n < min {
+		n = min
+	}
+	return n
+}
+
+func normalizeDownloadChunkSize(n int64) int64 {
+	const min = 5 * 1024 * 1024
+	const max = 60 * 1024 * 1024
+	if n <= 0 {
+		return 10 * 1024 * 1024
+	}
+	if n < min {
+		n = min
+	}
+	if n > max {
+		n = max
+	}
+	return n
+}
+
+type progressPrinter struct {
+	label       string
+	totalBytes  int64
+	totalChunks int64
+	threads     int
+	bytesDone   *int64
+	chunksDone  *int64
+
+	stopOnce sync.Once
+	stopCh   chan struct{}
+	wg       sync.WaitGroup
+}
+
+func newProgressPrinter(label string, totalBytes, totalChunks int64, threads int, bytesDone, chunksDone *int64) *progressPrinter {
+	if totalBytes < 0 {
+		totalBytes = 0
+	}
+	if totalChunks < 1 {
+		totalChunks = 1
+	}
+	if threads < 1 {
+		threads = 1
+	}
+	return &progressPrinter{
+		label:       label,
+		totalBytes:  totalBytes,
+		totalChunks: totalChunks,
+		threads:     threads,
+		bytesDone:   bytesDone,
+		chunksDone:  chunksDone,
+		stopCh:      make(chan struct{}),
+	}
+}
+
+func (p *progressPrinter) Start() {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		start := time.Now()
+		var lastTime = start
+		var lastBytes int64
+
+		for {
+			select {
+			case <-p.stopCh:
+				p.render(time.Since(start), 0, true)
+				return
+			case <-ticker.C:
+				now := time.Now()
+				done := atomic.LoadInt64(p.bytesDone)
+				dt := now.Sub(lastTime)
+				var speed float64
+				if dt > 0 {
+					speed = float64(done-lastBytes) / dt.Seconds()
+				}
+				lastTime = now
+				lastBytes = done
+				p.render(now.Sub(start), speed, false)
+			}
+		}
+	}()
+}
+
+func (p *progressPrinter) Stop() {
+	p.stopOnce.Do(func() { close(p.stopCh) })
+	p.wg.Wait()
+}
+
+func (p *progressPrinter) render(elapsed time.Duration, speed float64, final bool) {
+	done := atomic.LoadInt64(p.bytesDone)
+	chunks := atomic.LoadInt64(p.chunksDone)
+	if chunks < 0 {
+		chunks = 0
+	}
+	if chunks > p.totalChunks {
+		chunks = p.totalChunks
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > p.totalBytes && p.totalBytes > 0 {
+		done = p.totalBytes
+	}
+
+	percent := float64(0)
+	if p.totalBytes > 0 {
+		percent = float64(done) * 100 / float64(p.totalBytes)
+	}
+
+	speedStr := "-"
+	if speed > 0 {
+		speedStr = graph.FormatBytes(int64(speed)) + "/s"
+	}
+
+	line := fmt.Sprintf(
+		"%s %6.2f%% %s/%s  speed %s  threads %d  chunks %d/%d",
+		p.label,
+		percent,
+		graph.FormatBytes(done),
+		graph.FormatBytes(p.totalBytes),
+		speedStr,
+		p.threads,
+		chunks,
+		p.totalChunks,
+	)
+
+	if final {
+		fmt.Fprintln(os.Stderr, "\r"+line)
+		return
+	}
+	fmt.Fprint(os.Stderr, "\r"+line)
+	_ = elapsed
 }
