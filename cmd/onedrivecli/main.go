@@ -366,7 +366,7 @@ func cmdStatus(args []string) error {
 	if globalVerbose {
 		fmt.Printf("Drive: %s (%s)\n", drv.ID, drv.DriveType)
 	} else {
-		fmt.Printf("Drive: %s (id %s)\n", drv.DriveType, maskID(drv.ID))
+		fmt.Printf("Drive: %s (id: %s)\n", drv.DriveType, maskID(drv.ID))
 	}
 	fmt.Printf("Quota: total %s, used %s, remaining %s, deleted %s, state %s\n",
 		graph.FormatBytes(drv.Quota.Total),

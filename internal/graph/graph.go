@@ -633,10 +633,10 @@ func (c *Client) DownloadFile(ctx context.Context, remotePath, localPath string)
 }
 
 func (c *Client) downloadToFile(ctx context.Context, method, u, localPath string) error {
-	return c.downloadToFileWithCallbacks(ctx, method, u, localPath, TransferCallbacks{})
+	return c.downloadToFileWithCallbacks(ctx, method, u, localPath, TransferOptions{})
 }
 
-func (c *Client) downloadToFileWithCallbacks(ctx context.Context, method, u, localPath string, cb TransferCallbacks) error {
+func (c *Client) downloadToFileWithCallbacks(ctx context.Context, method, u, localPath string, opt TransferOptions) error {
 	token, err := c.AccessToken(ctx)
 	if err != nil {
 		return err
@@ -680,8 +680,22 @@ func (c *Client) downloadToFileWithCallbacks(ctx context.Context, method, u, loc
 		return err
 	}
 	w := io.Writer(out)
-	if cb.OnBytes != nil {
-		w = &countingWriter{w: w, on: cb.OnBytes}
+	if opt.Callbacks.OnBytes != nil && opt.Callbacks.OnChunk != nil {
+		cs := normalizeDownloadChunkSize(opt.ChunkSize)
+		var acc int64
+		w = &countingWriter{
+			w: w,
+			on: func(n int64) {
+				opt.Callbacks.OnBytes(n)
+				acc += n
+				for acc >= cs {
+					acc -= cs
+					opt.Callbacks.OnChunk()
+				}
+			},
+		}
+	} else if opt.Callbacks.OnBytes != nil {
+		w = &countingWriter{w: w, on: opt.Callbacks.OnBytes}
 	}
 	if _, err := io.Copy(w, res.Body); err != nil {
 		out.Close()
@@ -690,8 +704,8 @@ func (c *Client) downloadToFileWithCallbacks(ctx context.Context, method, u, loc
 	if err := out.Close(); err != nil {
 		return err
 	}
-	if cb.OnChunk != nil {
-		cb.OnChunk()
+	if opt.Callbacks.OnChunk != nil {
+		opt.Callbacks.OnChunk()
 	}
 	return os.Rename(tmp, localPath)
 }
@@ -734,7 +748,7 @@ func (c *Client) DownloadFileByPathWithOptions(ctx context.Context, remotePath, 
 	}
 	if it.DownloadURL == "" || it.Size <= 0 {
 		u2 := "https://graph.microsoft.com/v1.0/me/drive/root:" + graphPathEscape(remotePath) + ":/content"
-		return c.downloadToFileWithCallbacks(ctx, http.MethodGet, u2, localPath, opt.Callbacks)
+		return c.downloadToFileWithCallbacks(ctx, http.MethodGet, u2, localPath, opt)
 	}
 
 	size := it.Size
@@ -885,7 +899,7 @@ func (c *Client) DownloadFileByPathWithOptions(ctx context.Context, remotePath, 
 		_ = os.Remove(tmp)
 		if errors.Is(err, errRangeNotSupported) {
 			u2 := "https://graph.microsoft.com/v1.0/me/drive/root:" + graphPathEscape(remotePath) + ":/content"
-			return c.downloadToFileWithCallbacks(baseCtx, http.MethodGet, u2, localPath, opt.Callbacks)
+			return c.downloadToFileWithCallbacks(baseCtx, http.MethodGet, u2, localPath, opt)
 		}
 		return err
 	default:
