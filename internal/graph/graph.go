@@ -478,13 +478,52 @@ func (c *Client) simpleUpload(ctx context.Context, r io.Reader, size int64, remo
 func (c *Client) uploadSession(ctx context.Context, f *os.File, size int64, remotePath string, opt TransferOptions) error {
 	u := "https://graph.microsoft.com/v1.0/me/drive/root:" + graphPathEscape(remotePath) + ":/createUploadSession"
 	var sess createUploadSessionResponse
-	if err := c.doJSON(ctx, http.MethodPost, u, map[string]any{
+	body := mustJSON(map[string]any{
 		"item": map[string]any{
 			"@microsoft.graph.conflictBehavior": "replace",
 			"name":                              filepath.Base(remotePath),
 		},
-	}, &sess); err != nil {
-		return err
+	})
+
+	backoff := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 30 * time.Second}
+	for i := 0; ; i++ {
+		res, b, err := c.do(ctx, http.MethodPost, u, bytes.NewReader(body), map[string]string{
+			"Accept":       "application/json",
+			"Content-Type": "application/json",
+		})
+		if err != nil {
+			return err
+		}
+		if res.StatusCode >= 200 && res.StatusCode < 300 {
+			if err := json.Unmarshal(b, &sess); err != nil {
+				return err
+			}
+			break
+		}
+		var ge GraphError
+		_ = json.Unmarshal(b, &ge)
+		if res.StatusCode == http.StatusConflict && strings.EqualFold(ge.Error.Code, "nameAlreadyExists") &&
+			strings.Contains(strings.ToLower(ge.Error.Message), "currently being uploaded") {
+			if i >= len(backoff) {
+				return fmt.Errorf("createUploadSession conflict persists: %s: %s", ge.Error.Code, ge.Error.Message)
+			}
+			wait := backoff[i]
+			if c.Verbose {
+				fmt.Fprintln(os.Stderr, "Info createUploadSession: name already being uploaded, retrying in", wait)
+			}
+			t := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			case <-t.C:
+			}
+			continue
+		}
+		if ge.Error.Code != "" || ge.Error.Message != "" {
+			return fmt.Errorf("graph api failed: %s: %s", ge.Error.Code, ge.Error.Message)
+		}
+		return fmt.Errorf("graph api failed: %s", strings.TrimSpace(string(b)))
 	}
 	if sess.UploadURL == "" {
 		return errors.New("createUploadSession missing uploadUrl")
@@ -492,6 +531,11 @@ func (c *Client) uploadSession(ctx context.Context, f *os.File, size int64, remo
 
 	chunkSize := normalizeUploadChunkSize(opt.ChunkSize)
 	threads := normalizeThreads(opt.Threads)
+	// Some SharePoint-backed upload session endpoints are sensitive to parallel chunk PUTs.
+	// For endpoints with /_api/v2.0/drive/items/.../uploadSession, force sequential for reliability.
+	if strings.Contains(strings.ToLower(sess.UploadURL), "/_api/v2.0/drive/items/") {
+		threads = 1
+	}
 	totalChunks := int((size + chunkSize - 1) / chunkSize)
 	if totalChunks <= 1 {
 		threads = 1
@@ -545,6 +589,7 @@ func (c *Client) uploadSession(ctx context.Context, f *os.File, size int64, remo
 					return
 				}
 				req.Header.Set("Content-Length", strconv.Itoa(ck.size))
+				req.Header.Set("Content-Type", "application/octet-stream")
 				req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", ck.start, ck.end, size))
 				if c.UserAgent != "" {
 					req.Header.Set("User-Agent", c.UserAgent)
