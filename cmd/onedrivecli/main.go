@@ -106,7 +106,8 @@ func run(args []string) error {
 
 func printUsage() {
 	fmt.Println(strings.TrimSpace(`
-onedrivecli - OneDrive CLI (Microsoft Graph + OAuth2 Device Code)
+onedrivecli - OneDrive CLI by LxnChan
+https://lxnchan.cn
 
 Usage:
   onedrivecli [--config=<PATH>] [--user-agent=<UA>] [--proxy=<MODE>] [--verbose=<true|false>] <command> [options]
