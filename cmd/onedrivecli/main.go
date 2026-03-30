@@ -363,7 +363,11 @@ func cmdStatus(args []string) error {
 		fmt.Printf("Access token expires at: %s\n", "(unknown)")
 	}
 	fmt.Printf("Refresh token present: %t\n", cfg.Token.RefreshToken != "")
-	fmt.Printf("Drive: %s (%s)\n", drv.ID, drv.DriveType)
+	if globalVerbose {
+		fmt.Printf("Drive: %s (%s)\n", drv.ID, drv.DriveType)
+	} else {
+		fmt.Printf("Drive: %s (id %s)\n", drv.DriveType, maskID(drv.ID))
+	}
 	fmt.Printf("Quota: total %s, used %s, remaining %s, deleted %s, state %s\n",
 		graph.FormatBytes(drv.Quota.Total),
 		graph.FormatBytes(drv.Quota.Used),
@@ -1040,6 +1044,17 @@ func flagProvided(args []string, name string) bool {
 		}
 	}
 	return false
+}
+
+func maskID(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "(unknown)"
+	}
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:6] + "..." + s[len(s)-6:]
 }
 
 func parseByteSize(s string) (int64, error) {
