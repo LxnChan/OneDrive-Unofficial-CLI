@@ -486,6 +486,9 @@ func (c *Client) uploadSession(ctx context.Context, f *os.File, size int64, remo
 	})
 
 	backoff := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 30 * time.Second}
+	tempUsed := false
+	parentPath := normalizeRemotePath(filepath.ToSlash(filepath.Dir(remotePath)))
+	targetName := filepath.Base(remotePath)
 	for i := 0; ; i++ {
 		res, b, err := c.do(ctx, http.MethodPost, u, bytes.NewReader(body), map[string]string{
 			"Accept":       "application/json",
@@ -504,8 +507,30 @@ func (c *Client) uploadSession(ctx context.Context, f *os.File, size int64, remo
 		_ = json.Unmarshal(b, &ge)
 		if res.StatusCode == http.StatusConflict && strings.EqualFold(ge.Error.Code, "nameAlreadyExists") &&
 			strings.Contains(strings.ToLower(ge.Error.Message), "currently being uploaded") {
+			// After several retries, fall back to a temporary name, then rename after upload.
 			if i >= len(backoff) {
-				return fmt.Errorf("createUploadSession conflict persists: %s: %s", ge.Error.Code, ge.Error.Message)
+				ts := time.Now().Unix()
+				tempName := fmt.Sprintf(".%s.uploading-%d", targetName, ts)
+				tempPath := targetName
+				if parentPath == "" || parentPath == "/" {
+					tempPath = "/" + tempName
+				} else {
+					tempPath = parentPath + "/" + tempName
+				}
+				u = "https://graph.microsoft.com/v1.0/me/drive/root:" + graphPathEscape(tempPath) + ":/createUploadSession"
+				body = mustJSON(map[string]any{
+					"item": map[string]any{
+						"@microsoft.graph.conflictBehavior": "replace",
+						"name":                              tempName,
+					},
+				})
+				tempUsed = true
+				// reset retry
+				i = -1
+				if c.Verbose {
+					fmt.Fprintln(os.Stderr, "Info createUploadSession: using temp name", tempName)
+				}
+				continue
 			}
 			wait := backoff[i]
 			if c.Verbose {
@@ -670,7 +695,73 @@ func (c *Client) uploadSession(ctx context.Context, f *os.File, size int64, remo
 		return err
 	default:
 	}
+	// If we uploaded to a temp name, try to rename to target name.
+	if tempUsed {
+		// find the temp item by path and rename by id
+		// Instead, get parent listing and find the most recent matching prefix.
+		// Safer: compute again
+		// We derive tempName from upload URL path; as fallback, recompute the pattern used above
+		// Use timestamp-based pattern; here we cannot retrieve it reliably, so try a best-effort by scanning.
+		// To avoid complexity, attempt to rename the single file whose name starts with "."+targetName+".uploading-" and has size==uploaded size.
+		children, lerr := c.ListChildren(ctx, parentPath)
+		if lerr == nil {
+			prefix := "." + targetName + ".uploading-"
+			var cand *DriveItem
+			for i := range children {
+				if strings.HasPrefix(children[i].Name, prefix) && children[i].Size == size {
+					cand = &children[i]
+					break
+				}
+			}
+			if cand != nil {
+				renameBackoff := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 30 * time.Second}
+				for i := 0; ; i++ {
+					rerr := c.renameItemByID(ctx, cand.ID, targetName)
+					if rerr == nil {
+						break
+					}
+					if i >= len(renameBackoff) {
+						return fmt.Errorf("rename failed: %w", rerr)
+					}
+					t := time.NewTimer(renameBackoff[i])
+					select {
+					case <-ctx.Done():
+						t.Stop()
+						return ctx.Err()
+					case <-t.C:
+					}
+				}
+			}
+		}
+	}
 	return nil
+}
+
+func (c *Client) renameItemByID(ctx context.Context, id, newName string) error {
+	if id == "" || strings.TrimSpace(newName) == "" {
+		return errors.New("rename: invalid arguments")
+	}
+	body := map[string]any{"name": newName}
+	res, b, err := c.do(ctx, http.MethodPatch, "https://graph.microsoft.com/v1.0/me/drive/items/"+url.PathEscape(id), bytes.NewReader(mustJSON(body)), map[string]string{
+		"Accept":       "application/json",
+		"Content-Type": "application/json",
+	})
+	if err != nil {
+		return err
+	}
+	if res.StatusCode >= 200 && res.StatusCode < 300 {
+		return nil
+	}
+	var ge GraphError
+	_ = json.Unmarshal(b, &ge)
+	if res.StatusCode == http.StatusConflict && strings.EqualFold(ge.Error.Code, "nameAlreadyExists") &&
+		strings.Contains(strings.ToLower(ge.Error.Message), "currently being uploaded") {
+		return fmt.Errorf("rename conflict: %s: %s", ge.Error.Code, ge.Error.Message)
+	}
+	if ge.Error.Code != "" || ge.Error.Message != "" {
+		return fmt.Errorf("rename failed: %s: %s", ge.Error.Code, ge.Error.Message)
+	}
+	return fmt.Errorf("rename failed: %s", strings.TrimSpace(string(b)))
 }
 
 func (c *Client) DownloadFile(ctx context.Context, remotePath, localPath string) error {
