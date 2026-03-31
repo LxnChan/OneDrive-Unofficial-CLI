@@ -108,6 +108,7 @@ func printUsage() {
 	fmt.Println(strings.TrimSpace(`
 onedrivecli - OneDrive CLI by LxnChan
 https://lxnchan.cn
+For more, please visit: https://lxnchan.cn/works/onedriveCLI.html
 
 Usage:
   onedrivecli [--config=<PATH>] [--user-agent=<UA>] [--proxy=<MODE>] [--verbose=<true|false>] <command> [options]
