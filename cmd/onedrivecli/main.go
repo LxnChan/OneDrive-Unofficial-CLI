@@ -113,12 +113,39 @@ Usage:
   onedrivecli [--config=<PATH>] [--user-agent=<UA>] [--proxy=<MODE>] [--verbose=<true|false>] <command> [options]
 
 Commands:
-  login      Sign in (Device Code flow)
-  logout     Sign out (clear local token)
-  status     Show account and drive status
-  list       List remote directory
-  upload     Upload a file or folder
-  download   Download a file or folder
+  login
+  logout
+  status
+  list
+  upload
+  download
+
+Parameters:
+  Global:
+    --config=<PATH>           Config file path. Default: ./config.json next to the executable. On Linux, also tries /etc/odc/config.json
+    --user-agent=<UA>         Set User-Agent for all requests and persist to config.json
+    --proxy=<MODE>            Proxy: system/none or http(s)://host:port or host:port (persist to config.json)
+    --verbose=<true|false>    Enable verbose output
+
+  login:
+    --client-id=<ID>          Azure app (public client) client ID (default: built-in)
+    --tenant=<TENANT>         common/consumers/organizations or a specific tenant ID (default: common)
+    --scopes=<SCOPES>         Space or comma separated scopes (default: offline_access User.Read Files.ReadWrite.All)
+
+  list:
+    --path=<REMOTE_PATH>      Remote directory path (default: root)
+
+  upload:
+    --local=<LOCAL_PATH>      Local file or folder path
+    --remote=<REMOTE_PATH>    Remote target path
+    --chunk-size=<SIZE>       Chunk size (5MiB-60MiB, default: 10MiB)
+    --threads=<N>             Threads (default: 2)
+
+  download:
+    --remote=<REMOTE_PATH>    Remote file or folder path
+    --local=<LOCAL_PATH>      Local target path (optional for folders)
+    --chunk-size=<SIZE>       Chunk size (5MiB-60MiB, default: 10MiB)
+    --threads=<N>             Threads (default: 2)
 
 Examples:
   onedrivecli --config=./config.json status
