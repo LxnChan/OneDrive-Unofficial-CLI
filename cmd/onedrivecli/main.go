@@ -124,7 +124,7 @@ Parameters:
   Global:
     --config=<PATH>           Config file path. Default: ./config.json next to the executable. On Linux, also tries /etc/odc/config.json
     --user-agent=<UA>         Set User-Agent for all requests and persist to config.json
-    --proxy=<MODE>            Proxy: system/none or http(s)://host:port or host:port (persist to config.json)
+    --proxy=<MODE>            Proxy: system/none or http(s)://host:port or host:port (will persist to config.json)
     --verbose=<true|false>    Enable verbose output
 
   login:
