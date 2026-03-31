@@ -221,10 +221,10 @@ func cmdLogin(args []string) error {
 	}
 	if isFirstConfig {
 		if usedDefaultClientID {
-			fmt.Printf("Note: --client-id was not provided. Using built-in application ID. (you can override with --client-id=...)\n")
+			fmt.Printf("[Info] --client-id was not provided. Using built-in application ID. (you can override with --client-id=...)\n")
 		}
 		if !tenantProvided && *tenant == "common" {
-			fmt.Println("Note: --tenant was not provided. Using tenant=common.")
+			fmt.Println("[Info] --tenant was not provided. Using tenant=common.")
 		}
 	}
 

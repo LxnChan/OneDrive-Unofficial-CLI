@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,6 +97,152 @@ func (c *Client) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
+func redactURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User != nil {
+		u.User = url.UserPassword(u.User.Username(), "REDACTED")
+	}
+	q := u.Query()
+	redactKeys := []string{
+		"tempauth",
+		"access_token",
+		"refresh_token",
+		"client_secret",
+		"sig",
+		"signature",
+		"token",
+		"code",
+		"authkey",
+		"client_assertion",
+	}
+	for _, k := range redactKeys {
+		if q.Has(k) {
+			q.Set(k, "REDACTED")
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func redactHeaderValues(key string, vals []string) []string {
+	if strings.EqualFold(key, "authorization") ||
+		strings.EqualFold(key, "cookie") ||
+		strings.EqualFold(key, "set-cookie") ||
+		strings.EqualFold(key, "proxy-authorization") {
+		return []string{"REDACTED"}
+	}
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		out = append(out, v)
+	}
+	return out
+}
+
+func headersForLog(h http.Header) string {
+	if len(h) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		vals := redactHeaderValues(k, h.Values(k))
+		for _, v := range vals {
+			b.WriteString(k)
+			b.WriteString(": ")
+			b.WriteString(v)
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func safeBodyForLog(body []byte) string {
+	const max = 8 * 1024
+	if len(body) == 0 {
+		return ""
+	}
+
+	var v any
+	if err := json.Unmarshal(body, &v); err == nil {
+		redactAnyURLs(&v)
+		if m, ok := v.(map[string]any); ok {
+			redactJSONKeys(m)
+		}
+		b, err := json.MarshalIndent(v, "", "  ")
+		if err == nil {
+			body = b
+		}
+	}
+
+	if len(body) > max {
+		return string(body[:max]) + "\n... (truncated)"
+	}
+	return string(body)
+}
+
+func redactAnyURLs(v *any) {
+	switch t := (*v).(type) {
+	case map[string]any:
+		for k := range t {
+			val := t[k]
+			anyVal := any(val)
+			redactAnyURLs(&anyVal)
+			t[k] = anyVal
+		}
+	case []any:
+		for i := range t {
+			anyVal := any(t[i])
+			redactAnyURLs(&anyVal)
+			t[i] = anyVal
+		}
+	case string:
+		if strings.Contains(t, "://") && strings.Contains(t, "tempauth=") {
+			*v = redactURL(t)
+		}
+	}
+}
+
+func redactJSONKeys(m map[string]any) {
+	redactSet := map[string]struct{}{
+		"access_token":     {},
+		"refresh_token":    {},
+		"client_secret":    {},
+		"device_code":      {},
+		"client_assertion": {},
+		"assertion":        {},
+		"authorization":    {},
+		"code":             {},
+		"password":         {},
+	}
+	for k, v := range m {
+		if _, ok := redactSet[strings.ToLower(k)]; ok {
+			m[k] = "REDACTED"
+			continue
+		}
+		switch vv := v.(type) {
+		case map[string]any:
+			redactJSONKeys(vv)
+		case []any:
+			for i := range vv {
+				if mm, ok := vv[i].(map[string]any); ok {
+					redactJSONKeys(mm)
+				}
+			}
+		}
+	}
+}
+
 func (c *Client) do(ctx context.Context, method, u string, body io.Reader, extraHeaders map[string]string) (*http.Response, []byte, error) {
 	if c.AccessToken == nil {
 		return nil, nil, errors.New("access token provider is required")
@@ -118,7 +265,10 @@ func (c *Client) do(ctx context.Context, method, u string, body io.Reader, extra
 		}
 	}
 	if c.Verbose {
-		fmt.Fprintln(os.Stderr, method, u)
+		fmt.Fprintln(os.Stderr, ">>>", method, redactURL(u))
+		if hs := headersForLog(req.Header); hs != "" {
+			fmt.Fprintln(os.Stderr, hs)
+		}
 	}
 	res, err := c.httpClient().Do(req)
 	if err != nil {
@@ -136,7 +286,13 @@ func (c *Client) do(ctx context.Context, method, u string, body io.Reader, extra
 	}
 	res.Body.Close()
 	if c.Verbose {
-		fmt.Fprintln(os.Stderr, "Status", res.Status)
+		fmt.Fprintln(os.Stderr, "<<<", res.Status)
+		if hs := headersForLog(res.Header); hs != "" {
+			fmt.Fprintln(os.Stderr, hs)
+		}
+		if bs := safeBodyForLog(b); bs != "" {
+			fmt.Fprintln(os.Stderr, bs)
+		}
 	}
 	return res, b, nil
 }
@@ -153,6 +309,20 @@ func (c *Client) doJSON(ctx context.Context, method, u string, body any, out any
 		}
 		rdr = bytes.NewReader(b)
 		headers["Content-Type"] = "application/json"
+		if c.Verbose {
+			var v any
+			if err := json.Unmarshal(b, &v); err == nil {
+				anyVal := any(v)
+				redactAnyURLs(&anyVal)
+				if m, ok := anyVal.(map[string]any); ok {
+					redactJSONKeys(m)
+				}
+				if bb, err := json.MarshalIndent(anyVal, "", "  "); err == nil {
+					fmt.Fprintln(os.Stderr, ">>> body")
+					fmt.Fprintln(os.Stderr, safeBodyForLog(bb))
+				}
+			}
+		}
 	}
 	res, b, err := c.do(ctx, method, u, rdr, headers)
 	if err != nil {
@@ -620,7 +790,10 @@ func (c *Client) uploadSession(ctx context.Context, f *os.File, size int64, remo
 					req.Header.Set("User-Agent", c.UserAgent)
 				}
 				if c.Verbose {
-					fmt.Fprintln(os.Stderr, "PUT", sess.UploadURL)
+					fmt.Fprintln(os.Stderr, ">>>", "PUT", redactURL(sess.UploadURL))
+					if hs := headersForLog(req.Header); hs != "" {
+						fmt.Fprintln(os.Stderr, hs)
+					}
 				}
 
 				res, err := hc.Do(req)
@@ -643,7 +816,13 @@ func (c *Client) uploadSession(ctx context.Context, f *os.File, size int64, remo
 					return
 				}
 				if c.Verbose {
-					fmt.Fprintln(os.Stderr, "Status", res.Status)
+					fmt.Fprintln(os.Stderr, "<<<", res.Status)
+					if hs := headersForLog(res.Header); hs != "" {
+						fmt.Fprintln(os.Stderr, hs)
+					}
+					if bs := safeBodyForLog(b); bs != "" {
+						fmt.Fprintln(os.Stderr, bs)
+					}
 				}
 
 				if res.StatusCode == http.StatusAccepted || (res.StatusCode >= 200 && res.StatusCode < 300) {
@@ -786,7 +965,10 @@ func (c *Client) downloadToFileWithCallbacks(ctx context.Context, method, u, loc
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
 	if c.Verbose {
-		fmt.Fprintln(os.Stderr, method, u)
+		fmt.Fprintln(os.Stderr, ">>>", method, redactURL(u))
+		if hs := headersForLog(req.Header); hs != "" {
+			fmt.Fprintln(os.Stderr, hs)
+		}
 	}
 
 	res, err := c.httpClient().Do(req)
@@ -795,7 +977,10 @@ func (c *Client) downloadToFileWithCallbacks(ctx context.Context, method, u, loc
 	}
 	defer res.Body.Close()
 	if c.Verbose {
-		fmt.Fprintln(os.Stderr, "Status", res.Status)
+		fmt.Fprintln(os.Stderr, "<<<", res.Status)
+		if hs := headersForLog(res.Header); hs != "" {
+			fmt.Fprintln(os.Stderr, hs)
+		}
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		b, _ := io.ReadAll(res.Body)
@@ -947,7 +1132,10 @@ func (c *Client) DownloadFileByPathWithOptions(ctx context.Context, remotePath, 
 					req.Header.Set("User-Agent", c.UserAgent)
 				}
 				if c.Verbose {
-					fmt.Fprintln(os.Stderr, "GET", it.DownloadURL)
+					fmt.Fprintln(os.Stderr, ">>>", "GET", redactURL(it.DownloadURL))
+					if hs := headersForLog(req.Header); hs != "" {
+						fmt.Fprintln(os.Stderr, hs)
+					}
 				}
 
 				res, err := hc.Do(req)
@@ -960,7 +1148,10 @@ func (c *Client) DownloadFileByPathWithOptions(ctx context.Context, remotePath, 
 					return
 				}
 				if c.Verbose {
-					fmt.Fprintln(os.Stderr, "Status", res.Status)
+					fmt.Fprintln(os.Stderr, "<<<", res.Status)
+					if hs := headersForLog(res.Header); hs != "" {
+						fmt.Fprintln(os.Stderr, hs)
+					}
 				}
 				if res.StatusCode == http.StatusOK && (ck.start != 0 || ck.end != size-1) {
 					res.Body.Close()

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -49,6 +50,109 @@ type ErrorResponse struct {
 	CorrelationID    string `json:"correlation_id"`
 }
 
+func redactURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User != nil {
+		u.User = url.UserPassword(u.User.Username(), "REDACTED")
+	}
+	q := u.Query()
+	redactKeys := []string{"code", "client_secret", "client_assertion", "refresh_token", "access_token", "device_code"}
+	for _, k := range redactKeys {
+		if q.Has(k) {
+			q.Set(k, "REDACTED")
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func redactHeaderValues(key string, vals []string) []string {
+	if strings.EqualFold(key, "authorization") ||
+		strings.EqualFold(key, "cookie") ||
+		strings.EqualFold(key, "set-cookie") ||
+		strings.EqualFold(key, "proxy-authorization") {
+		return []string{"REDACTED"}
+	}
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		out = append(out, v)
+	}
+	return out
+}
+
+func headersForLog(h http.Header) string {
+	if len(h) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		vals := redactHeaderValues(k, h.Values(k))
+		for _, v := range vals {
+			b.WriteString(k)
+			b.WriteString(": ")
+			b.WriteString(v)
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func safeJSONForLog(body []byte) string {
+	const max = 8 * 1024
+	if len(body) == 0 {
+		return ""
+	}
+	var v any
+	if err := json.Unmarshal(body, &v); err == nil {
+		redactAny(&v)
+		if b, err := json.MarshalIndent(v, "", "  "); err == nil {
+			body = b
+		}
+	}
+	if len(body) > max {
+		return string(body[:max]) + "\n... (truncated)"
+	}
+	return string(body)
+}
+
+func redactAny(v *any) {
+	switch t := (*v).(type) {
+	case map[string]any:
+		for k := range t {
+			kl := strings.ToLower(k)
+			if kl == "access_token" || kl == "refresh_token" || kl == "device_code" || kl == "client_secret" || kl == "client_assertion" {
+				t[k] = "REDACTED"
+				continue
+			}
+			val := any(t[k])
+			redactAny(&val)
+			t[k] = val
+		}
+	case []any:
+		for i := range t {
+			val := any(t[i])
+			redactAny(&val)
+			t[i] = val
+		}
+	case string:
+		if strings.Contains(t, "://") {
+			*v = redactURL(t)
+		}
+	}
+}
+
 func (c *Client) DeviceCode(ctx context.Context) (*DeviceCodeResponse, error) {
 	if c.ClientID == "" {
 		return nil, errors.New("client_id is required")
@@ -72,7 +176,10 @@ func (c *Client) DeviceCode(ctx context.Context) (*DeviceCodeResponse, error) {
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
 	if c.Verbose {
-		fmt.Fprintln(os.Stderr, "POST", u)
+		fmt.Fprintln(os.Stderr, ">>>", "POST", redactURL(u))
+		if hs := headersForLog(req.Header); hs != "" {
+			fmt.Fprintln(os.Stderr, hs)
+		}
 	}
 
 	hc := c.HTTP
@@ -85,12 +192,20 @@ func (c *Client) DeviceCode(ctx context.Context) (*DeviceCodeResponse, error) {
 	}
 	defer res.Body.Close()
 	if c.Verbose {
-		fmt.Fprintln(os.Stderr, "Status", res.Status)
+		fmt.Fprintln(os.Stderr, "<<<", res.Status)
+		if hs := headersForLog(res.Header); hs != "" {
+			fmt.Fprintln(os.Stderr, hs)
+		}
 	}
 
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, err
+	}
+	if c.Verbose {
+		if bs := safeJSONForLog(b); bs != "" {
+			fmt.Fprintln(os.Stderr, bs)
+		}
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		var er ErrorResponse
@@ -148,7 +263,10 @@ func (c *Client) PollToken(ctx context.Context, dc *DeviceCodeResponse) (*TokenR
 			req.Header.Set("User-Agent", c.UserAgent)
 		}
 		if c.Verbose {
-			fmt.Fprintln(os.Stderr, "POST", u)
+			fmt.Fprintln(os.Stderr, ">>>", "POST", redactURL(u))
+			if hs := headersForLog(req.Header); hs != "" {
+				fmt.Fprintln(os.Stderr, hs)
+			}
 		}
 
 		res, err := hc.Do(req)
@@ -161,7 +279,13 @@ func (c *Client) PollToken(ctx context.Context, dc *DeviceCodeResponse) (*TokenR
 			return nil, err
 		}
 		if c.Verbose {
-			fmt.Fprintln(os.Stderr, "Status", res.Status)
+			fmt.Fprintln(os.Stderr, "<<<", res.Status)
+			if hs := headersForLog(res.Header); hs != "" {
+				fmt.Fprintln(os.Stderr, hs)
+			}
+			if bs := safeJSONForLog(b); bs != "" {
+				fmt.Fprintln(os.Stderr, bs)
+			}
 		}
 
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
@@ -232,7 +356,10 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (*TokenRespon
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
 	if c.Verbose {
-		fmt.Fprintln(os.Stderr, "POST", u)
+		fmt.Fprintln(os.Stderr, ">>>", "POST", redactURL(u))
+		if hs := headersForLog(req.Header); hs != "" {
+			fmt.Fprintln(os.Stderr, hs)
+		}
 	}
 
 	hc := c.HTTP
@@ -245,12 +372,20 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (*TokenRespon
 	}
 	defer res.Body.Close()
 	if c.Verbose {
-		fmt.Fprintln(os.Stderr, "Status", res.Status)
+		fmt.Fprintln(os.Stderr, "<<<", res.Status)
+		if hs := headersForLog(res.Header); hs != "" {
+			fmt.Fprintln(os.Stderr, hs)
+		}
 	}
 
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, err
+	}
+	if c.Verbose {
+		if bs := safeJSONForLog(b); bs != "" {
+			fmt.Fprintln(os.Stderr, bs)
+		}
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		var er ErrorResponse
